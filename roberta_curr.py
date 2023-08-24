@@ -2,6 +2,7 @@ from pathlib import Path
 from turtle import setup
 from transformers.utils import logging
 from transformers import RobertaTokenizer, RobertaForSequenceClassification, AutoModelForSequenceClassification, AutoTokenizer, RobertaConfig
+from transformers.models.roberta.modeling_roberta import RobertaClassificationHead
 import math
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
@@ -35,55 +36,47 @@ def get_lambda(step, all_steps, warmup_steps, type):
         )
 
 
-def train(args):
+def train(args,trainset,valset,testset = None):
     setup_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.initial_point) 
-    if not args.multi_class:   
-        raw_data = datasets.load_dataset('imdb', split ='train')
-        train_data, val_data = train_test_split(raw_data,test_size = args.test_size, random_state = 123)
-        test_data = datasets.load_dataset('imdb', split ='test')
-        test_data = test_data[:]
+    PATH = args.ptr_model_path
+    model_file_name = PATH + '/best_model_{}.pth'.format(args.gpu_id)
+    if testset is None:
         model = RobertaForSequenceClassification.from_pretrained(args.initial_point)
     else:
-        train_data,val_data,test_data = get_10class_data()
         config = RobertaConfig.from_pretrained(args.initial_point)
         config.num_labels = 10
-        model = RobertaForSequenceClassification.from_pretrained(args.initial_point, config = config)
-    shuffle_id_train = shuffle(np.arange(len(train_data['text'])), random_state=123)
-    shuffle_id_val = shuffle(np.arange(len(val_data['text'])), random_state=123)
-    data_id = None
-    if args.n_sample is not None:
-        data_id = shuffle_id_train[:args.n_sample]
-        pos_r, train_data = sample(train_data, data_id)
-        val_id = shuffle_id_val[:int(args.n_sample*args.test_size/(1-args.test_size))]
-        _, val_data = sample(val_data, val_id)
-        # print(pos_r)
-    if args.augfile is not None:
-        aug_data = get_aug_data(args.augfile, train_data, data_id,separate=True, label_pool=args.label_pool)
-    testset = IMDBDataset(tokenizer,  test_data, args.max_len)
-    trainset_s = IMDBDataset(tokenizer,  aug_data, args.max_len)
-    trainset_g = IMDBDataset(tokenizer,  train_data, args.max_len)
-    valset = IMDBDataset(tokenizer,  val_data, args.max_len)
+        model = RobertaForSequenceClassification.from_pretrained(args.initial_point)
+        para = torch.load(model_file_name,'cpu')
+        model.load_state_dict(para)
+        model.classifier = RobertaClassificationHead(config)
+        model.num_labels = 10
+        # para = torch.load(model_file_name)
+        # keys_to_remove = list()
+        # for k,v in para.items():
+        #     if 'classifier' in k:
+        #         keys_to_remove.append(k)
+        # for key in keys_to_remove:
+        #     del para[key]
+        # model.load_state_dict(para, strict = False)
+        # del para
     optimizer = optim.Adam(model.parameters(), lr = 0)
-    print(len(trainset_s),len(trainset_g),  len(valset), len(testset))
+    print(len(trainset),  len(valset))
     model = model.to(args.device)
     if args.multi_gpu:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
-        train_sampler_s = torch.utils.data.distributed.DistributedSampler(trainset_s)
-        train_sampler_g = torch.utils.data.distributed.DistributedSampler(trainset_g)
-        trainloader_s = torch.utils.data.DataLoader(trainset_s, batch_size=args.train_bz,shuffle=False, sampler = train_sampler_s, num_workers=0)
-        trainloader_g = torch.utils.data.DataLoader(trainset_g, batch_size=args.train_bz,shuffle=False, sampler = train_sampler_g, num_workers=0)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(trainset)
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_bz,shuffle=False, sampler = train_sampler, num_workers=0)
     else:
-        trainloader = torch.utils.data.DataLoader(trainset_s, batch_size=args.train_bz,shuffle=True, num_workers=0)
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_bz,shuffle=True, num_workers=0)
     valloader = torch.utils.data.DataLoader(valset, batch_size=args.val_bz, shuffle=False, num_workers=0)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=args.val_bz, shuffle=False, num_workers=0)
-    print(len(trainloader_s),len(trainloader_g),len(valloader),len(testloader))
-    n_epoches = args.epoch
+    print(len(trainloader),len(valloader))
+    if testset is not None:
+        testloader = torch.utils.data.DataLoader(testset, batch_size=args.val_bz, shuffle=False, num_workers=0)
+        print(len(testset),len(testloader))
+    n_epoches = args.s_epoch if testset is None else args.epoch
     accumulate_step = args.acc_step
-    total_steps_s = math.ceil(n_epoches*len(trainloader_s)/(args.train_bz * accumulate_step))
-    total_steps_g = math.ceil(n_epoches*len(trainloader_g)/(args.train_bz * accumulate_step))
-    wm_steps_s = int(total_steps_s*args.wm_ratio)
-    wm_steps_g = int(total_steps_g*args.wm_ratio)
+    total_steps = math.ceil(n_epoches*len(trainloader)/(args.train_bz * accumulate_step))
+    wm_steps = int(total_steps*args.wm_ratio)
     print('***********do training***********')
     batch_counter = 0
     step_counter = 0
@@ -91,37 +84,13 @@ def train(args):
     log_file = open('{}.txt'.format(args.logfile_name),'w')
     print_loss = True
     max_acc = 0.0
-    max_lr = args.lr_s
-    PATH = args.ptr_model_path
-    model_file_name = PATH + '/best_model_{}.pth'.format(args.gpu_id)
+    max_lr = args.lr_s if testset is None else args.lr_g
     if not os.path.exists(PATH):
         os.mkdir(PATH)
-    train_loss = 0.0
-    trainloader = trainloader_s
-    total_steps = total_steps_s
-    wm_steps = wm_steps_s      
+    train_loss = 0.0   
     for epoch in range(n_epoches):
         model.train()
-        if args.multi_gpu:
-            if epoch < args.s_epoch:
-                train_sampler_s.set_epoch(epoch)
-            else:
-                train_sampler_g.set_epoch(epoch)
-        if epoch == args.s_epoch:
-            del trainloader
-            trainloader = trainloader_g
-            total_steps = total_steps_g
-            wm_steps = wm_steps_g            
-            max_acc = 0.0
-            batch_counter = 0
-            step_counter = 0
-            max_lr = args.lr_g
-            if (not args.multi_gpu) or args.local_rank == 0:
-                if args.multi_gpu:
-                    model.module.load_state_dict(torch.load(model_file_name))
-                else:
-                    model.load_state_dict(torch.load(model_file_name))            
-            torch.cuda.empty_cache()
+        train_sampler.set_epoch(epoch)
         for id,item in tqdm(enumerate(trainloader)):
             data,label = item[0],item[1]
             data['input_ids'] = data['input_ids'].to(args.device)
@@ -176,7 +145,7 @@ def train(args):
                 else:
                     torch.save(model.state_dict(), model_file_name)
                 print('*******best model updated*******')
-    if (not args.multi_gpu) or args.local_rank == 0:
+    if ((not args.multi_gpu) or args.local_rank == 0) and testset is not None:
         correct_num = 0
         total_num = 0
         if args.multi_gpu:
@@ -202,8 +171,8 @@ def main():
     parser.add_argument('--gpu_id', type=str, default = '0')
     parser.add_argument('--initial_point', type=str, default = 'roberta-large')
     parser.add_argument('--ptr_model_path', type=str, default = './models')
-    parser.add_argument('--multi_class', action='store_true', default = False)
     parser.add_argument('--label_pool', action='store_true', default = False)
+    parser.add_argument('--silver', action='store_true', default = False)
     parser.add_argument('--schedule', type=str, help='type of scheduler',default = 'linear')
     parser.add_argument('--wm_ratio', type =float, help='ratio of warmup steps', default = 0.05)
     parser.add_argument('--max_len', type=int, help='max length when tokenization', default=512)
@@ -219,8 +188,32 @@ def main():
     parser.add_argument('--s_epoch', type=int, help='training epoch', default=2)
     parser.add_argument('--log_step', type=int, help='step interval to log loss information', default=200)
     parser.add_argument('--logfile_name', type=str, default = 'training_log')
-    parser.add_argument('--augfile', type=str, help='augmentation file, summ_aug or aeda_aug', default = None)
+    parser.add_argument('--augfile', type=str, help='augmentation file, summ_aug or aeda_aug', default = 'summ_aug_multiclass')
     args = parser.parse_args()
+    train_data,val_data,test_data = get_10class_data()
+    shuffle_id_train = shuffle(np.arange(len(train_data['text'])), random_state=123)
+    shuffle_id_val = shuffle(np.arange(len(val_data['text'])), random_state=123)
+    data_id = None
+    if args.n_sample is not None:
+        data_id = shuffle_id_train[:args.n_sample]
+        pos_r, train_data = sample(train_data, data_id)
+        val_id = shuffle_id_val[:int(args.n_sample*args.test_size/(1-args.test_size))]
+        _, val_data = sample(val_data, val_id)
+        # print(pos_r)
+    tokenizer = AutoTokenizer.from_pretrained(args.initial_point) 
+    aug_data = get_aug_data(args.augfile, train_data, data_id,separate=True, label_pool=args.label_pool)
+    aug_train_x, aug_val_x,aug_train_y,aug_val_y = train_test_split(aug_data['text'],aug_data['label'], test_size = args.test_size, random_state = 123)
+    aug_train = dict()
+    aug_train['text'] = aug_train_x
+    aug_train['label'] = aug_train_y
+    aug_val = dict()
+    aug_val['text'] = aug_val_x
+    aug_val['label'] = aug_val_y
+    testset = IMDBDataset(tokenizer,  test_data, args.max_len)
+    trainset_s = IMDBDataset(tokenizer,  aug_train, args.max_len)
+    trainset_g = IMDBDataset(tokenizer,  train_data, args.max_len)
+    valset_s = IMDBDataset(tokenizer,  aug_val, args.max_len)
+    valset_g = IMDBDataset(tokenizer,  val_data, args.max_len)    
     gpu_ids = [int(x) for x in args.gpu_id.split(',')]
     args.multi_gpu = (len(gpu_ids) > 1)
     if args.multi_gpu:
@@ -231,7 +224,11 @@ def main():
         args.device = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
     else:
         args.device = 'cuda:{}'.format(args.gpu_id) if torch.cuda.is_available() else 'cpu'
-    train(args)
+    if args.silver:
+        train(args,trainset_s,valset_s)
+    else:
+        train(args,trainset_g,valset_g,testset)
+    
 
 if __name__=='__main__':
     main()
